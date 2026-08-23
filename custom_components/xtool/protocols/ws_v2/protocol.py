@@ -62,7 +62,6 @@ import json
 import logging
 import ssl
 import time
-import uuid
 from collections.abc import AsyncIterator, Callable
 from datetime import datetime
 from typing import Any
@@ -108,14 +107,15 @@ WSV2_PING_TRANSACTION_ID = 65510
 # Studio's generateTransactionId rotates a uint16-ish counter — we
 # wrap below the ping id to keep the two pools disjoint.
 WSV2_TRANSACTION_ID_WRAP = 65500
-# Shared client-session id. The instruction, file_stream and
-# media_stream sockets must all present the SAME ``id`` query
-# parameter (see module docstring) — V2 firmware binds a pending
-# file-transfer channel to the client session that requested it.
-# A fresh uuid4 per socket makes the file_stream connection look
-# like an unrelated client, so FILE_DATA is never delivered and
-# the device eventually reports ``-7 transfer timeout``.
-_CLIENT_SESSION_ID = uuid.uuid4()
+def _new_client_session_id() -> str:
+    """Return the millisecond client id used by xTool Studio.
+
+    The P3 routes instruction, file-transfer, and live-media traffic by
+    this value.  It must be shared by every socket in one connection and
+    must use Studio's numeric millisecond format; a UUID can leave the
+    instruction channel working while the media socket receives no video.
+    """
+    return str(int(time.time() * 1000))
 
 # Frame-format constants (Studio's MessageEncoder.encodeFrame /
 # MessageParser.extractCompletePackets, both gated by
@@ -435,7 +435,7 @@ async def probe_v2(host: str, timeout: float = WSV2_PROBE_TIMEOUT) -> bool:
     """
     url = (
         f"wss://{host}:{WSV2_PORT}{WSV2_PATH}"
-        f"?id={_CLIENT_SESSION_ID}&function=instruction"
+        f"?id={_new_client_session_id()}&function=instruction"
     )
     try:
         async with aiohttp.ClientSession() as session:
@@ -556,6 +556,7 @@ class WSV2Protocol(XtoolProtocol):
     def __init__(self, host: str, port: int = WSV2_PORT) -> None:
         super().__init__(host)
         self._port = port
+        self._client_session_id = _new_client_session_id()
         self._session: aiohttp.ClientSession | None = None
         self._ws_instr: aiohttp.ClientWebSocketResponse | None = None
         self._ws_file: aiohttp.ClientWebSocketResponse | None = None
@@ -658,9 +659,12 @@ class WSV2Protocol(XtoolProtocol):
             await self._open_instruction_ws()
 
     async def _open_instruction_ws(self) -> None:
+        # A reconnect is a new Studio-style client session. All subordinate
+        # file/media sockets reuse this exact value until the next reconnect.
+        self._client_session_id = _new_client_session_id()
         url = (
             f"wss://{self.host}:{self._port}{WSV2_PATH}"
-            f"?id={_CLIENT_SESSION_ID}&function=instruction"
+            f"?id={self._client_session_id}&function=instruction"
         )
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession()
@@ -925,7 +929,7 @@ class WSV2Protocol(XtoolProtocol):
             raise ConnectionError("V2 WebSocket session is not connected")
         url = (
             f"wss://{self.host}:{self._port}{WSV2_PATH}"
-            f"?id={_CLIENT_SESSION_ID}&function=media_stream"
+            f"?id={self._client_session_id}&function=media_stream"
         )
         self._ws_media = await self._session.ws_connect(
             url,
@@ -2572,7 +2576,7 @@ class WSV2Protocol(XtoolProtocol):
             self._session = aiohttp.ClientSession()
         url = (
             f"wss://{self.host}:{self._port}{WSV2_PATH}"
-            f"?id={_CLIENT_SESSION_ID}&function=file_stream"
+            f"?id={self._client_session_id}&function=file_stream"
         )
         async with self._session.ws_connect(
             url,
@@ -2719,7 +2723,7 @@ class WSV2Protocol(XtoolProtocol):
             self._session = aiohttp.ClientSession()
         url = (
             f"wss://{self.host}:{self._port}{WSV2_PATH}"
-            f"?id={_CLIENT_SESSION_ID}&function=file_stream"
+            f"?id={self._client_session_id}&function=file_stream"
         )
         buffer = bytearray(filesize)
         received = 0
