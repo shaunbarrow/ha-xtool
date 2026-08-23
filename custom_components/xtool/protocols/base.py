@@ -126,6 +126,14 @@ class XtoolDeviceModel:
     has_smoking_fan: bool = False
     has_fill_light: bool = False
     has_fill_light_dual: bool = False  # F-family V2: separate Front + Back channels
+    # Some V2 firmwares only drive the fill-light LED array above a
+    # PWM floor (~20/255) — Studio applies a matching offset transform
+    # (bundle helper ``Q7``: ``(device-20)*99/235+1`` on read,
+    # ``(pct-1)*235/99+20`` on write) so the user-facing slider stays
+    # 0-100 %. Models set this to 20 to opt in; the fill-light entity
+    # scales HA brightness accordingly. Defaults to 0 (linear
+    # passthrough) for models whose bundle uses ``device/255*100``.
+    fill_light_device_min: int = 0
     has_device_sleep: bool = False  # ``autoSleepEnable`` config bool
     has_move_stop: bool = False
     has_beeper: bool = False
@@ -167,6 +175,13 @@ class XtoolDeviceModel:
     has_cooling_fan: bool = False  # WS-V2: built-in cooling-fan peripheral
     has_runtime_stats: bool = False  # WS-V2: /v1/device/statistics exposes
     # last_job_time / working_seconds / standby_seconds / tool_runtime / print_tool_type
+    # WS-V2: xTool "Auto mode" / Material-Detection access control
+    # (config key ``mdMode``). Studio bundle labels the toggle
+    # ``enable_access_control`` and gates it per-model via an
+    # ``isSupport`` predicate — leave defaulted False; only enable
+    # on models where the safety-key access-control workflow
+    # actually applies.
+    has_md_mode: bool = False
     has_button_event: bool = False  # WS-V2: /button/status push fires
     has_inkjet: bool = False  # M2: inkjet head + /v1/project/inkjet/*
     has_inkjet_sensors: bool = False  # DT001: ink/water bottles, heater, film sensors
@@ -275,6 +290,7 @@ class XtoolDeviceState:
     workhead_id: str = ""  # M1 Ultra mounted tool head
     workhead_z_height: float | None = None  # M1 Ultra
     flame_level_hl: int | None = None  # config kv flameLevelHLSelect (1=high, 2=low)
+    md_mode_enabled: bool | None = None  # config kv mdMode ("Auto mode" access-control)
     # Push peripheral states
     drawer_open: bool | None = None  # /peripheral/drawer
     cooling_fan_running: bool | None = None  # /peripheral/cooling_fan

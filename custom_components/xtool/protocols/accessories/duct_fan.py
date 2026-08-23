@@ -15,7 +15,6 @@ from __future__ import annotations
 from .base import (
     MCODE_FAN_BUZZER,
     MCODE_FAN_INFO,
-    MCODE_FAN_RUN_DURATION,
     MCODE_FAN_SET_GEAR,
     AccessoryDefinition,
     AccessoryEntitySpec,
@@ -133,24 +132,30 @@ def parse_fan_v3_info(text: str) -> dict[str, object]:
 
     Wire shape on F2 Ultra UV firmware ``40.130.021.00.ht2``:
 
-    ``A<version> B<gear> C<c_state> D<mode_class> E:"<sn>" S<buzzer> Z<online>``
+    ``A<version> B<gear> C<c_state> D<mode_class> E:"<sn>" S<s> Z<buzzer>``
 
-    Field semantics (verified live; v2.5.8 retest 14-action trace):
+    Field semantics (Studio bundle ``getFanInfoV3`` for
+    GS009-CLASS-4 is authoritative — verified live via v2.7.1
+    retest, Issue #4):
 
-    - ``A`` is the firmware-version string. Contains dots — parsed
-      positionally as ``tokens[0]`` to avoid colliding with B/C/D
-      via a generic numeric scan.
+    - ``A`` = firmware-version string; contains dots so parsed
+      positionally as ``tokens[0]``.
     - ``B`` = ``current_gear`` — motor speed indicator (Manual:
       1-4 = gear; Manual Off: residual RPM of the previous gear;
       Auto: ramping speed).
-    - ``C`` = ``c_state`` — alternates 2/3 across mode transitions;
-      semantically unclear, kept for debugging. Earlier revs
-      misnamed this ``control_mode``, which was wrong.
+    - ``C`` = ``c_state`` — transient state indicator; alternates
+      2/3 across mode transitions, semantically unclear, kept for
+      debug visibility.
     - ``D`` = ``mode_class`` — authoritative mode discriminator:
-      ``2`` = Manual Off, ``3`` = Manual running, ``4`` = Auto
-      running. Earlier revs misnamed this ``target_gear``, which
-      was wrong.
-    - ``S`` = buzzer-enable flag, ``Z`` = online flag.
+      ``2`` = Manual Off, ``3`` = Manual running, ``4`` = Auto.
+    - **``Z`` = ``buzzer_enable``** (per Studio bundle
+      ``fanBuzzerEnable: yC(t, 'Z') === 1``). Earlier revs
+      swapped S / Z here; the swap caused the buzzer switch to
+      bounce back to ``off`` after the user toggled it on, and
+      the entity to display stale ``off`` while the physical
+      buzzer was actually enabled.
+    - ``S`` = write-side echo of the last ``M9079 S<x>`` command
+      — Studio ignores it on read; not surfaced.
 
     ``mode_class=4`` (Auto) does NOT carry the Regular/Quiet
     sub-mode in the poll reply. The set-handler caches it in
@@ -166,15 +171,16 @@ def parse_fan_v3_info(text: str) -> dict[str, object]:
     current_gear = fields["B"]
     c_state = fields["C"]
     mode_class = fields["D"]
-    buzzer = fields["S"]
-    connected = fields["Z"]
+    buzzer = fields["Z"]
     return {
         "version": version,
         "current_gear": current_gear,
         "c_state": c_state,
         "mode_class": mode_class,
         "buzzer_enable": bool(buzzer) if buzzer is not None else None,
-        "connected": bool(connected) if connected is not None else None,
+        # M9082 reply presence itself proves the accessory is
+        # connected — we wouldn't be parsing this reply otherwise.
+        "connected": True,
         "sn": quoted(text, "E:"),
         # mode_speed left ``None`` here — the V2 coordinator's
         # accessory merge step calls ``derive_fan_v3_mode_speed``
@@ -202,7 +208,9 @@ def parse_fan_v3_push(text: str) -> dict[str, object]:
     - ``B`` / ``C`` = transient state indicators; alternate 2/3
       across mode transitions, semantically unclear, kept for
       debug visibility.
-    - ``S`` = buzzer-enable mirror.
+    - ``S`` = write-side echo of the last ``M9079 S<x>`` command;
+      Studio ignores it and so do we. Buzzer state is refreshed
+      from the M9082 poll (see :func:`parse_fan_v3_info`).
 
     Auto sub-mode (Regular vs Quiet) is NOT recoverable from the
     push — neither the poll nor the push reliably distinguishes
@@ -212,15 +220,19 @@ def parse_fan_v3_push(text: str) -> dict[str, object]:
     HA-side write or a fresh sub-mode hint arrives.
     """
     f = _v3_tokens(text, include_a=True)
-    out: dict[str, object] = {
-        "mode_class": f["D"],
-        "c_state": f["C"],
-    }
+    out: dict[str, object] = {"c_state": f["C"]}
+    # Push frames emitted during a Studio-initiated speed change
+    # carry ``D0`` (transitional / not-yet-settled). Merging that
+    # into ``mode_class`` briefly reports the fan as "off" until
+    # the next M9082 poll restores the real value — that's the
+    # bounce reported on the fan entity in Issue #4 v2.7.1 retest.
+    # Only accept the documented mode discriminators
+    # (2 = Manual Off, 3 = Manual running, 4 = Auto running).
+    if f["D"] in (2, 3, 4):
+        out["mode_class"] = f["D"]
     a_token = f["A"]
     if f["D"] == 3 and a_token is not None and 0 <= a_token <= 4:
         out["current_gear"] = a_token
-    if f["S"] is not None:
-        out["buzzer_enable"] = bool(f["S"])
     return out
 
 
@@ -298,17 +310,19 @@ _ENTITIES_V3 = (
                         icon="mdi:bell-ring",
                         write_mcode=lambda on: f"{MCODE_FAN_BUZZER} S{1 if on else 0}",
                         entity_category="config"),
-    # Inline-fan post-run timer (``M9085 T<seconds>``). Studio's
-    # ``setFanV3RunDuration`` route writes the same M-code. Value is
-    # mirrored from the laser-host ``smokingFanDelay`` push, which the
-    # coordinator merges into ``fields['post_run_seconds']`` for the
-    # paired IF2 2.0 accessory.
+    # Inline-fan post-run timer (read-only). Studio's
+    # ``setFanV3RunDuration`` hard-wires ``M9085 T0`` and never
+    # exposes a user-facing slider on the IF2 side — the value is
+    # authored on the laser via ``purifierTimeout`` (see the
+    # F-family "Exhaust time after processing" Number) and mirrored
+    # to the IF2 via the ``smokingFanDelay`` push. Exposing it as a
+    # read-only Sensor here so users can verify the mirror without
+    # having a second writable control that would fight the
+    # laser-side source of truth.
     AccessoryEntitySpec(
-        "number", "post_run", field="post_run_seconds",
+        "sensor", "post_run", field="post_run_seconds",
         icon="mdi:fan-clock", unit="s",
-        min_value=0, max_value=300, step=5,
-        write_mcode=lambda v: f"{MCODE_FAN_RUN_DURATION} T{int(v)}",
-        entity_category="config",
+        entity_category="diagnostic",
     ),
 )
 

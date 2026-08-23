@@ -47,6 +47,7 @@ from homeassistant.components.switch import (
     SwitchEntity,
 )
 from homeassistant.components.update import UpdateEntity
+from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.const import (
     EntityCategory,
     PERCENTAGE,
@@ -598,6 +599,7 @@ class _WSV2ConfigSwitch(XtoolEntity, SwitchEntity):
         config_key: str,
         state_attr: str,
         icon: str | None = None,
+        enabled_default: bool = True,
     ) -> None:
         super().__init__(coordinator)
         self._set_unique_id(f"{key}")
@@ -606,6 +608,7 @@ class _WSV2ConfigSwitch(XtoolEntity, SwitchEntity):
         self._state_attr = state_attr
         if icon is not None:
             self._attr_icon = icon
+        self._attr_entity_registry_enabled_default = enabled_default
 
     @property
     def is_on(self) -> bool | None:
@@ -730,6 +733,42 @@ class _WSV2PeripheralSwitch(XtoolEntity, SwitchEntity):
         if self.coordinator.data is not None:
             setattr(self.coordinator.data, self._state_attr, False)
         self.async_write_ha_state()
+
+
+class _WSV2IRLedSwitch(_WSV2PeripheralSwitch, RestoreEntity):
+    """Red-dot / IR-LED switch that survives HA restarts.
+
+    Studio's ``controlRedLed`` bundle only defines a PUT route —
+    firmware exposes no GET or push for the IR LED state, so a
+    fresh HA start has no way to learn whether the LED is
+    physically lit. The last HA-side write is the best proxy:
+    restore it on ``async_added_to_hass`` and let the base
+    ``_WSV2PeripheralSwitch`` optimistic write path keep it in
+    sync from there.
+    """
+
+    _restored_is_on: bool | None = None
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        last = await self.async_get_last_state()
+        if last is not None and last.state in ("on", "off"):
+            self._restored_is_on = last.state == "on"
+            if (
+                self.coordinator.data is not None
+                and getattr(self.coordinator.data, self._state_attr, None) is None
+            ):
+                setattr(
+                    self.coordinator.data, self._state_attr,
+                    self._restored_is_on,
+                )
+
+    @property
+    def is_on(self) -> bool | None:
+        live = super().is_on
+        if live is not None:
+            return live
+        return self._restored_is_on
 
 
 # --- Numbers -----------------------------------------------------------
@@ -876,11 +915,17 @@ class _WSV2FillLightBase(XtoolEntity, LightEntity):
         if d is None:
             return None
         # WS-V2 firmware exposes ``fillLightBright*`` on the 0-255
-        # scale natively — same range as HA's Light brightness. No
-        # scaling needed. (v2.5.8 normalized through a 0-100 device
-        # alias which halved the perceived brightness; Issue #4
-        # retest datapoints confirmed.)
-        return int(getattr(d, self._state_attr) or 0)
+        # scale natively. Some F-series bundles apply a
+        # ``(device-20)*99/235+1`` offset transform for their
+        # slider display; we mirror it here so the HA slider
+        # percentage matches Studio's percentage (Issue #4
+        # v2.7.1 retest datapoints on GS009-CLASS-4). Models
+        # without the offset (``fill_light_device_min=0``, e.g.
+        # F1 Lite / F2 / M2) keep linear passthrough.
+        return _fill_light_device_to_ha(
+            int(getattr(d, self._state_attr) or 0),
+            self.coordinator.model.fill_light_device_min,
+        )
 
     def _other_value(self) -> int:
         d = self.coordinator.data
@@ -899,12 +944,16 @@ class _WSV2FillLightBase(XtoolEntity, LightEntity):
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         ha_brightness = int(kwargs.get(ATTR_BRIGHTNESS, BRIGHTNESS_HA_MAX))
+        device_value = _fill_light_ha_to_device(
+            ha_brightness,
+            self.coordinator.model.fill_light_device_min,
+        )
         await self.coordinator.protocol.set_config(
-            self._config_key, ha_brightness,
+            self._config_key, device_value,
         )
         if self.coordinator.data is not None:
             setattr(
-                self.coordinator.data, self._state_attr, ha_brightness,
+                self.coordinator.data, self._state_attr, device_value,
             )
         self.async_write_ha_state()
 
@@ -913,6 +962,33 @@ class _WSV2FillLightBase(XtoolEntity, LightEntity):
         if self.coordinator.data is not None:
             setattr(self.coordinator.data, self._state_attr, 0)
         self.async_write_ha_state()
+
+
+def _fill_light_ha_to_device(ha_brightness: int, device_min: int) -> int:
+    """Map HA brightness (0-255) → device value.
+
+    ``device_min`` = 0 (default) means the firmware accepts the raw
+    0-255 HA value 1:1. ``device_min`` > 0 (F-series V2 bundles that
+    use Studio's ``Q7`` transform) reserves the device range
+    ``[device_min, 255]`` for a HA value ≥ 1 and maps HA 0 to
+    device 0 (off).
+    """
+    if device_min <= 0:
+        return max(0, min(255, ha_brightness))
+    if ha_brightness <= 0:
+        return 0
+    span_dev = 255 - device_min
+    return round((ha_brightness - 1) * span_dev / 254 + device_min)
+
+
+def _fill_light_device_to_ha(device_value: int, device_min: int) -> int:
+    """Inverse of :func:`_fill_light_ha_to_device`."""
+    if device_min <= 0:
+        return max(0, min(255, device_value))
+    if device_value <= 0:
+        return 0
+    span_dev = 255 - device_min
+    return max(1, min(255, round((device_value - device_min) * 254 / span_dev + 1)))
 
 
 class WSV2FillLight(_WSV2FillLightBase):
@@ -938,15 +1014,19 @@ class WSV2FillLight(_WSV2FillLightBase):
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         ha_brightness = int(kwargs.get(ATTR_BRIGHTNESS, BRIGHTNESS_HA_MAX))
-        await self.coordinator.protocol.set_config(
-            "fillLightBrightFront", ha_brightness,
+        device_value = _fill_light_ha_to_device(
+            ha_brightness,
+            self.coordinator.model.fill_light_device_min,
         )
         await self.coordinator.protocol.set_config(
-            "fillLightBrightBack", ha_brightness,
+            "fillLightBrightFront", device_value,
+        )
+        await self.coordinator.protocol.set_config(
+            "fillLightBrightBack", device_value,
         )
         if self.coordinator.data is not None:
-            self.coordinator.data.fill_light_a = ha_brightness
-            self.coordinator.data.fill_light_b = ha_brightness
+            self.coordinator.data.fill_light_a = device_value
+            self.coordinator.data.fill_light_b = device_value
         self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs: Any) -> None:
@@ -1132,10 +1212,18 @@ class _WSV2Camera(XtoolEntity, Camera):
     Stream integration, which provides HLS/WebRTC playback and still-frame
     extraction. Other models retain the snapshot/MJPEG fallback until their
     live camera names and payloads are confirmed on hardware.
+
+    ``_attr_is_streaming = True`` since v2.7.2 — the
+    ``handle_async_mjpeg_stream`` path was confirmed working on F2
+    Ultra UV (Issue #4 v2.7.1 retest, "both seem to be streaming,
+    nice work"). HA now reports ``streaming`` as the entity state
+    and auto-refreshes Lovelace picture-card thumbnails from the
+    MJPEG feed. ``camera.snapshot`` continues to consume the
+    still-image cache maintained in :meth:`async_camera_image`.
     """
 
     _camera_name: str = ""
-    _attr_is_streaming = False
+    _attr_is_streaming = True
 
     def __init__(
         self,
@@ -1692,11 +1780,30 @@ def build_wsv2_switches(coordinator: XtoolCoordinator) -> list[SwitchEntity]:
         # ``WSV2Coordinator._poll_accessories``).
     ])
     if model.has_flame_alarm:
+        # Disabled by default in the entity registry — disabling
+        # this switch means no flame alarm will be triggered per
+        # xTool Studio's own warning ("Fires may cause serious
+        # injuries and property damage"). Users who need
+        # programmatic control can enable it explicitly.
         entities.append(
             _WSV2ConfigSwitch(
                 coordinator, "flame_alarm_v2", "flameAlarm",
                 "flame_alarm_v2_enabled",
                 "mdi:fire-alert",
+                enabled_default=False,
+            )
+        )
+    if model.has_md_mode:
+        # xTool "Auto mode" / Material-Detection access control:
+        # once enabled the device requires a physical safety key
+        # to start processing (Studio bundle label
+        # ``enable_access_control``). Wire is the standard
+        # ``/v1/device/configs`` PUT with ``{mdMode: bool}``.
+        entities.append(
+            _WSV2ConfigSwitch(
+                coordinator, "md_mode", "mdMode",
+                "md_mode_enabled",
+                "mdi:key-variant",
             )
         )
     if model.has_machine_lock:
@@ -1751,8 +1858,11 @@ def build_wsv2_switches(coordinator: XtoolCoordinator) -> list[SwitchEntity]:
         # exposes two LEDs the ``closeup`` variant can be added back.
         # User-facing label is "Red dot" (matches Studio's wording);
         # icon is the laser-pointer crosshair Studio uses too.
+        # Uses the restoring switch subclass — firmware provides no
+        # read for the IR LED state, so the last HA-side write is
+        # replayed on restart until the user toggles again.
         entities.append(
-            _WSV2PeripheralSwitch(
+            _WSV2IRLedSwitch(
                 coordinator, "ir_led", "ir_led",
                 "ir_led_global", "mdi:laser-pointer",
                 SwitchDeviceClass.SWITCH,
